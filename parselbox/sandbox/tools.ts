@@ -20,6 +20,36 @@ export interface Tool {
   handler: (context: ToolContext, args: any) => Promise<McpToolResult>;
 }
 
+type ErrorCode =
+  | "TIMEOUT"
+  | "PERMISSION_DENIED"
+  | "PYTHON_EXCEPTION"
+  | "UNKNOWN";
+
+function formatError(error: any): { code: ErrorCode; message: string } {
+  const msg = error instanceof Error ? error.message : String(error);
+
+  if (
+    error instanceof Deno.errors.PermissionDenied ||
+    msg.includes("Permission denied")
+  ) {
+    return {
+      code: "PERMISSION_DENIED",
+      message: `Sandbox Permission Error: ${msg}`,
+    };
+  }
+
+  if (msg.includes("Execution timed out")) {
+    return { code: "TIMEOUT", message: msg };
+  }
+
+  if (msg.includes("PythonError") || msg.includes("Traceback")) {
+    return { code: "PYTHON_EXCEPTION", message: msg };
+  }
+
+  return { code: "UNKNOWN", message: msg };
+}
+
 function listFilesRecursive(
   pyodide: PyodideInterface,
   dirPath: string
@@ -85,90 +115,47 @@ export async function readPackagePermissions(): Promise<PackagePermissions> {
 const configureSandboxTool: Tool = {
   name: "configure",
   config: {
-    title: "Configure Python Environment",
-    description:
-      "Configures the Python sandbox by loading packages and/or setting up callbacks to the host. Both actions are optional.",
+    title: "Configure Python Sandbox.",
+    description: "Configure Python Sandbox.",
     inputSchema: {
-      globals: z
-        .record(z.any())
-        .optional()
-        .describe(
-          "A dictionary of global variables to inject into the Python scope."
-        ),
-      mounts: z
-        .record(z.string())
-        .optional()
-        .describe("Dictionary of folders to mount to /mnt/{name} (Read-Only)."),
-      output_dir: z
-        .string()
-        .optional()
-        .describe("Absolute path on host to mount as / (Writeable)."),
-      tools: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "List of function names for direct callbacks from Python to the host."
-        ),
-      proxy_tools: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "List of object names for dynamic proxies from Python to the host."
-        ),
-      packages: z
-        .array(z.string())
-        .optional()
-        .describe("List of packages to load into the Pyodide environment."),
-      disable_net: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe(
-          "If true, revokes all network access after loading packages."
-        ),
-      disable_runtime_packages: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe(
-          "If true, prevents any more packages from being installed or modified."
-        ),
+      globals: z.record(z.any()).optional(),
+      mounts: z.record(z.string()).optional(),
+      output_dir: z.string().optional(),
+      tools: z.array(z.string()).optional(),
+      proxy_tools: z.array(z.string()).optional(),
+      packages: z.array(z.string()).optional(),
+      disable_net: z.boolean().optional().default(false),
+      disable_runtime_packages: z.boolean().optional().default(false),
     },
-    outputSchema: { is_success: z.boolean() },
+    outputSchema: {
+      is_success: z.boolean(),
+      error_code: z
+        .enum(["TIMEOUT", "PERMISSION_DENIED", "PYTHON_EXCEPTION", "UNKNOWN"])
+        .optional(),
+      error: z.string().optional(),
+    },
   },
-  handler: async (
-    { pyodide, WORK_DIR },
-    {
-      globals,
-      mounts,
-      output_dir,
-      tools,
-      proxy_tools,
-      packages,
-      disable_net,
-      disable_runtime_packages,
-    }
-  ) => {
+  handler: async ({ pyodide, WORK_DIR }, args) => {
     try {
-      if (globals) {
-        for (const [key, value] of Object.entries(globals)) {
+      if (args.globals) {
+        for (const [key, value] of Object.entries(args.globals)) {
           pyodide.globals.set(key, pyodide.toPy(value));
         }
       }
 
-      if (output_dir) {
+      if (args.output_dir) {
         pyodide.FS.mount(
           pyodide.FS.filesystems.NODEFS,
-          { root: output_dir },
+          { root: args.output_dir },
           WORK_DIR
         );
       }
 
-      if (mounts && Object.keys(mounts).length > 0) {
+      if (args.mounts && Object.keys(args.mounts).length > 0) {
         const mountRoot = path.join(WORK_DIR, "mnt");
         pyodide.FS.mkdirTree(mountRoot);
 
-        for (const [name, hostPath] of Object.entries(mounts)) {
+        for (const [name, hostPath] of Object.entries(args.mounts)) {
           const mountPoint = path.join(mountRoot, name);
           pyodide.FS.mkdirTree(mountPoint);
           pyodide.FS.mount(
@@ -179,21 +166,21 @@ const configureSandboxTool: Tool = {
         }
       }
 
-      if (tools?.length || proxy_tools?.length) {
+      if (args.tools?.length || args.proxy_tools?.length) {
         const createCallback = pyodide.globals.get("_create_host_callback");
         const DynamicProxyClass = pyodide.globals.get("_DynamicProxy");
 
-        (tools ?? []).forEach((name: string) => {
+        (args.tools ?? []).forEach((name: string) => {
           const callbackFunc = createCallback(name);
           pyodide.globals.set(name, callbackFunc);
         });
 
-        (proxy_tools ?? []).forEach((name: string) => {
+        (args.proxy_tools ?? []).forEach((name: string) => {
           pyodide.globals.set(name, DynamicProxyClass(name));
         });
       }
 
-      if (packages?.length) {
+      if (args.packages?.length) {
         const perms = await readPackagePermissions();
 
         if (perms.isNetworkDisabled) {
@@ -205,7 +192,7 @@ const configureSandboxTool: Tool = {
           throw new Error("Runtime package loading is disabled.");
         }
 
-        await pyodide.loadPackage(packages);
+        await pyodide.loadPackage(args.packages);
       }
 
       return {
@@ -223,10 +210,10 @@ const configureSandboxTool: Tool = {
         isError: true,
       };
     } finally {
-      if (disable_net) {
+      if (args.disable_net) {
         await Deno.permissions.revoke({ name: "net" });
       }
-      if (disable_runtime_packages) {
+      if (args.disable_runtime_packages) {
         await Deno.permissions.revoke({
           name: "write",
           path: Deno.env.get("PACKAGE_CACHE_DIR"),
@@ -240,65 +227,63 @@ const executePythonTool: Tool = {
   name: "execute_python",
   config: {
     title: "Execute Python Code",
-    description:
-      "Executes Python code in the sandbox and optionally saves new files.",
+    description: "Executes Python code.",
     inputSchema: {
-      code: z.string().describe("The Python code to execute."),
-      timeout: z.number().optional().describe("Execution timeout in seconds."),
-      auto_load_packages: z
-        .boolean()
-        .optional()
-        .default(false)
-        .describe("Whether packages should be auto-loaded."),
+      code: z.string(),
+      timeout: z.number().optional(),
+      auto_load_packages: z.boolean().optional().default(false),
     },
     outputSchema: {
       is_success: z.boolean(),
       result: z.any().optional(),
+      files: z.array(z.string()).optional(),
       error: z.string().optional(),
-      files: z
-        .array(z.string())
-        .optional()
-        .describe("Absolute paths to any output files saved on the host."),
+      error_code: z
+        .enum(["TIMEOUT", "PERMISSION_DENIED", "PYTHON_EXCEPTION", "UNKNOWN"])
+        .optional(),
     },
   },
   handler: async (
     { pyodide, WORK_DIR },
     { code, timeout, auto_load_packages }
   ) => {
-    const filesBefore = getVFSState(pyodide, WORK_DIR);
     let timeoutId: number | undefined;
 
-    if (auto_load_packages) {
-      await pyodide.loadPackagesFromImports(code);
-    }
-
-    const execOptions = {
-      filename: "main.py",
-      return_mode: "last_expr_or_assign" as const,
-    };
-
     try {
+      const filesBefore = getVFSState(pyodide, WORK_DIR);
+
+      if (auto_load_packages) {
+        await pyodide.loadPackagesFromImports(code);
+      }
+
       const interruptBuffer = new Int32Array(new SharedArrayBuffer(4));
       pyodide.setInterruptBuffer(interruptBuffer);
 
-      const executionPromise = pyodide.runPythonAsync(code, execOptions);
+      const execOptions = {
+        filename: "main.py",
+        return_mode: "last_expr_or_assign" as const,
+      };
 
+      const executionPromise = pyodide.runPythonAsync(code, execOptions);
       let resultProxy;
+
       if (timeout && timeout > 0) {
-        const timeoutPromise = new Promise((_, reject) => {
-          timeoutId = setTimeout(() => {
-            Atomics.store(interruptBuffer, 0, 2);
-            reject(new Error(`Execution timed out after ${timeout} seconds`));
-          }, timeout * 1000);
-        });
-        resultProxy = await Promise.race([executionPromise, timeoutPromise]);
+        resultProxy = await Promise.race([
+          executionPromise,
+          new Promise((_, reject) => {
+            timeoutId = setTimeout(() => {
+              Atomics.store(interruptBuffer, 0, 2); // SIGINT
+              reject(new Error(`Execution timed out after ${timeout} seconds`));
+            }, timeout * 1000);
+          }),
+        ]);
       } else {
         resultProxy = await executionPromise;
       }
 
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
+      const result =
+        resultProxy?.toJs?.({ dict_converter: Object.fromEntries }) ??
+        resultProxy; // TODO: robust serialize outputs
 
       const output_files: string[] = [];
       const filesAfter = getVFSState(pyodide, WORK_DIR);
@@ -311,39 +296,31 @@ const executePythonTool: Tool = {
         }
       }
 
-      const result =
-        resultProxy?.toJs?.({ dict_converter: Object.fromEntries }) ??
-        resultProxy; // TODO: robust serialize outputs
-
-      const message =
-        output_files.length > 0
-          ? `\nGenerated ${output_files.length} file(s).`
-          : "";
-
       return {
         structuredContent: {
           is_success: true,
           result,
           files: output_files,
+        },
+        content: [{ type: "text", text: JSON.stringify({ result }, null, 2) }],
+      };
+    } catch (error: any) {
+      const { code, message } = formatError(error);
+      const isSystemError = code === "TIMEOUT" || code === "PERMISSION_DENIED";
+
+      return {
+        structuredContent: {
+          is_success: false,
           error: message,
           error_code: code,
         },
-        content: [
-          { type: "text", text: JSON.stringify({ result }, null, 2) + message },
-        ],
+        content: [{ type: "text", text: message }],
+        isError: isSystemError,
       };
-    } catch (error: any) {
+    } finally {
       if (timeoutId) {
         clearTimeout(timeoutId);
       }
-      return {
-        structuredContent: { error: error.message },
-        content: [
-          { type: "text", text: `Python Execution Error: ${error.message}` },
-        ],
-        isError: true,
-      };
-    } finally {
       pyodide.setInterruptBuffer(undefined);
     }
   },

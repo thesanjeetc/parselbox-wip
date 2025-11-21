@@ -29,16 +29,28 @@ class Result:
     error: Optional[str] = None
 
 
-class SandboxError(Exception): ...
+class SandboxError(Exception):
+    """Base class for all sandbox errors."""
+
+    pass
 
 
-class SandboxSystemError(SandboxError): ...
+class SandboxTimeoutError(SandboxError):
+    """Raised when code execution exceeds the time limit."""
+
+    pass
 
 
-class SandboxExecutionError(SandboxError): ...
+class SandboxPermissionError(SandboxError):
+    """Raised when the sandbox is denied access to a resource (net/fs)."""
+
+    pass
 
 
-class SandboxTimeout(SandboxExecutionError): ...
+class SandboxRuntimeError(SandboxError):
+    """Raised when the Python code inside the sandbox fails (Syntax/Runtime)."""
+
+    pass
 
 
 DENO_SCRIPT_PATH = str(Path(__file__).parent.resolve() / "sandbox" / "sandbox.ts")
@@ -180,6 +192,8 @@ class PythonSandbox:
         await self.initialize()
 
     async def initialize(self):
+        disable_net = (not bool(self.allow_net)) and (not self.auto_load_packages)
+
         await self._configure(
             globals=self.globals,
             mounts=self.mounts,
@@ -187,7 +201,7 @@ class PythonSandbox:
             tools=self.tools,
             proxy_tools=self.proxy_tools,
             packages=self.packages,
-            disable_net=not bool(self.allow_net),
+            disable_net=disable_net,
             disable_runtime_packages=not self.auto_load_packages,
         )
         await self.upload_files(self.files)
@@ -239,10 +253,28 @@ class PythonSandbox:
     async def _call_mcp(self, name, payload):
         if not self.is_connected():
             raise RuntimeError("Sandbox is not connected.")
-        result = await self.client.call_tool(name, payload, raise_on_error=False)
+        try:
+            result = await self.client.call_tool(name, payload, raise_on_error=False)
+        except Exception as e:
+            if "Connection closed" in str(e) or "closed" in str(e).lower():
+                raise SandboxRuntimeError(f"Sandbox crashed or connection closed: {e}")
+            raise SandboxError(f"Communication error: {e}")
         if result.is_error:
-            raise RuntimeError(result.content[0].text)
+            if result.structured_content and "error_code" in result.structured_content:
+                self._raise_for_error(result.structured_content)
+            error_text = result.content[0].text if result.content else "Unknown error"
+            raise SandboxError(f"MCP Protocol Error: {error_text}")
         return result.structured_content
+
+    def _raise_for_error(self, content: Dict[str, Any]):
+        """Inspects the structured content and raises specific exceptions."""
+        code = content.get("error_code")
+        msg = content.get("error", "Unknown Error")
+
+        if code == "TIMEOUT":
+            raise SandboxTimeoutError(msg)
+        if code == "PERMISSION_DENIED":
+            raise SandboxPermissionError(msg)
 
     async def _configure(
         self,
@@ -281,6 +313,9 @@ class PythonSandbox:
             payload["disable_runtime_packages"] = disable_runtime_packages
 
         result = await self._call_mcp("configure", payload)
+        if not result.get("is_success"):
+            self._raise_for_error(result)
+            raise SandboxError(f"Configuration failed: {result.get('error')}")
         return result
 
     async def upload_files(self, files: List[str]):
