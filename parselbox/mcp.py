@@ -24,7 +24,7 @@ async def run_session(config_data: dict, auto_mode: bool):
         # Note: CodeMode is assumed to be imported or defined in this scope
         async with CodeMode(config_data) as sandbox:
 
-            click.secho(f"\n✓ CodeMode Initialized", fg="green")
+            click.secho("\n✓ CodeMode Initialized", fg="green")
             click.secho(f"  - Servers: {len(sandbox.servers)}", fg="blue")
             click.secho(f"  - Tools: {len(sandbox.tool_schemas)}", fg="blue")
 

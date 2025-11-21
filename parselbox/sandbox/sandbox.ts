@@ -9,9 +9,6 @@ import {
   SetLevelRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const deno_dir = Deno.env.get("DENO_DIR");
-await Deno.permissions.revoke({ name: "write", path: deno_dir });
-
 const WORK_DIR = "/workspace";
 
 const PY_SETUP = `
@@ -59,54 +56,32 @@ class _DynamicProxy:
             "kwargs": kwargs
         })
 
-class AttrDict:
-    def __init__(self, data):
-        self._data = {}
-        for key, value in data.items():
-            self._data[key] = self._wrap(value)
-    def keys(self): return self._data.keys()
-    def values(self): return self._data.values()
-    def items(self): return self._data.items()
-    def _wrap(self, value):
-        if isinstance(value, dict): return AttrDict(value)
-        if isinstance(value, list): return [self._wrap(item) for item in value]
-        return value
-    def __getattr__(self, name):
-        try: return self._data[name]
-        except KeyError: raise AttributeError(f"'AttrDict' object has no attribute '{name}'")
-    def __getitem__(self, key): return self._data[key]
-    def __repr__(self): return f"AttrDict({self._data})"
+def robust_serialize(obj) -> str:
+    def _robust_serialize(obj, ancestors=None):
+        if isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
 
-def _js_convert(res):
-    if not hasattr(res, 'to_py'): return res
-    return AttrDict(res.to_py())
+        if ancestors is None:
+            ancestors = set()
 
-def serialize_py(obj) -> str:
-  def _robust_serialize(obj, seen=None):
-      if seen is None:
-          seen = set()
+        obj_id = id(obj)
+        if obj_id in ancestors:
+            return {"type": "circular_reference", "repr": repr(obj)}
+        
+        next_ancestors = ancestors | {obj_id}
 
-      obj_id = id(obj)
-      if obj_id in seen:
-          return {"type": "circular_reference", "repr": repr(obj)}
-      seen.add(obj_id)
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return [_robust_serialize(item, next_ancestors) for item in obj]
 
-      if isinstance(obj, (str, int, float, bool, type(None))):
-          return obj
+        if isinstance(obj, dict):
+            return {str(key): _robust_serialize(value, next_ancestors) for key, value in obj.items()}
 
-      if isinstance(obj, (list, tuple, set, frozenset)):
-          return [_robust_serialize(item, seen) for item in obj]
+        if isinstance(obj, (datetime.date, datetime.datetime)):
+            return obj.isoformat()
 
-      if isinstance(obj, dict):
-          return {str(key): _robust_serialize(value, seen) for key, value in obj.items()}
+        return {"type": "not_serializable", "repr": repr(obj)}
 
-      if isinstance(obj, (datetime.date, datetime.datetime)):
-          return obj.isoformat()
-
-      return {"type": "not_serializable", "repr": repr(obj)}
-
-  serialized_result = _robust_serialize(obj)
-  return json.dumps(serialized_result, indent=2)
+    return json.dumps(_robust_serialize(obj))
 `;
 
 const LogLevels: LoggingLevel[] = [
@@ -146,10 +121,13 @@ function createServerLogger(
 }
 
 async function main() {
+  const deno_dir = Deno.env.get("DENO_DIR");
+  await Deno.permissions.revoke({ name: "write", path: deno_dir });
+
   const mcpServer = new McpServer(
     {
-      name: "pyodide-sandbox-server-deno",
-      version: "1.0.0",
+      name: "parselbox-sandbox",
+      version: "0.0.1",
     },
     {
       capabilities: {
@@ -216,7 +194,7 @@ async function main() {
 
   pyodide.globals.set("_js_host_rpc_bridge", jsHostRPCBridge);
 
-  const context: ToolContext = { pyodide, mcpServer, WORK_DIR };
+  const context: ToolContext = { pyodide, mcpServer, WORK_DIR, logger };
 
   for (const tool of TOOLS) {
     mcpServer.registerTool(tool.name, tool.config, (args) =>

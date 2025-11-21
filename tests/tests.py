@@ -1,15 +1,11 @@
-import asyncio
 import os
-import shutil
 import pytest
-from pathlib import Path
 from textwrap import dedent
 from parselbox import (
     PythonSandbox,
     SandboxTimeoutError,
     SandboxPermissionError,
     SandboxRuntimeError,
-    SandboxError,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -301,6 +297,87 @@ class TestPackagesAndNetwork:
             )
             res = await sandbox.execute_python(code)
             assert res.output == "connected"
+
+
+class TestSerialization:
+    async def test_serialization_complex_structure(self):
+        async with PythonSandbox() as sandbox:
+            code = dedent(
+                """
+                data = {
+                    "list": [1, 2, 3],
+                    "dict": {"a": 1, "b": 2},
+                    "bool": True,
+                    "none": None
+                }
+                data
+            """
+            )
+            result = await sandbox.execute_python(code)
+            assert result.output.get("list") == [1, 2, 3]
+            assert result.output.get("dict") == {"a": 1, "b": 2}
+            assert result.output.get("bool") is True
+            assert result.output.get("none") is None
+
+    async def test_serialization_sets_and_tuples(self):
+        async with PythonSandbox() as sandbox:
+            code = dedent(
+                """
+                s = {1, 2, 3}
+                t = (4, 5, 6)
+                {"set": s, "tuple": t}
+            """
+            )
+            result = await sandbox.execute_python(code)
+            assert sorted(result.output["set"]) == [1, 2, 3]
+            assert result.output["tuple"] == [4, 5, 6]
+
+    async def test_serialization_datetime(self):
+        async with PythonSandbox() as sandbox:
+            code = dedent(
+                """
+                import datetime
+                d = datetime.date(2023, 10, 27)
+                t = datetime.datetime(2023, 10, 27, 12, 0, 0)
+                {"date": d, "time": t}
+            """
+            )
+            result = await sandbox.execute_python(code)
+            assert result.output["date"] == "2023-10-27"
+            assert "2023-10-27" in result.output["time"]
+
+    async def test_serialization_circular_reference(self):
+        async with PythonSandbox() as sandbox:
+            code = dedent(
+                """
+                a = {"name": "A"}
+                b = {"name": "B", "parent": a}
+                a["child"] = b
+                a
+            """
+            )
+            result = await sandbox.execute_python(code)
+            assert result.output["name"] == "A"
+            assert result.output["child"]["name"] == "B"
+            cycle = result.output["child"]["parent"]
+            assert cycle["type"] == "circular_reference"
+            assert "'name': 'A'" in cycle["repr"]
+
+    async def test_serialization_custom_object(self):
+        async with PythonSandbox() as sandbox:
+            code = dedent(
+                """
+                class User:
+                    def __init__(self, id):
+                        self.id = id
+                    def __repr__(self):
+                        return f"<User id={self.id}>"
+                User(123)
+            """
+            )
+            result = await sandbox.execute_python(code)
+            assert result.output["type"] == "not_serializable"
+            assert result.output["repr"] == "<User id=123>"
 
 
 class TestLogging:

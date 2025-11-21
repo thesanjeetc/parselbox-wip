@@ -2,8 +2,8 @@ import asyncio
 import json
 import os
 import shutil
-from parselbox import PythonSandbox, Callback
-from PIL import Image, ImageDraw, ImageFont
+from parselbox import PythonSandbox
+from PIL import Image, ImageDraw
 import httpx
 
 

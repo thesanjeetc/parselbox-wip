@@ -7,6 +7,8 @@ import type {
 } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { PyodideInterface } from "pyodide";
 
+declare function createServerLogger(): any;
+
 export interface ToolContext {
   pyodide: PyodideInterface;
   mcpServer: McpServer;
@@ -25,6 +27,17 @@ type ErrorCode =
   | "PERMISSION_DENIED"
   | "PYTHON_EXCEPTION"
   | "UNKNOWN";
+
+export interface PackagePermissions {
+  isNetworkDisabled: boolean;
+  isRuntimePackagesDisabled: boolean;
+}
+
+const PACKAGE_DOWNLOAD_DOMAINS = [
+  "cdn.jsdelivr.net:443",
+  "pypi.org:443",
+  "files.pythonhosted.org:443",
+];
 
 function formatError(error: any): { code: ErrorCode; message: string } {
   const msg = error instanceof Error ? error.message : String(error);
@@ -56,11 +69,16 @@ function listFilesRecursive(
 ): string[] {
   const allFiles: string[] = [];
   const scan = (currentPath: string) => {
-    for (const entry of pyodide.FS.readdir(currentPath)) {
+    const entries = pyodide.FS.readdir(currentPath);
+    for (const entry of entries) {
       if (entry === "." || entry === "..") continue;
       const fullPath = path.join(currentPath, entry);
-      if (pyodide.FS.isDir(pyodide.FS.stat(fullPath).mode)) scan(fullPath);
-      else allFiles.push(fullPath);
+      const mode = pyodide.FS.stat(fullPath).mode;
+      if (pyodide.FS.isDir(mode)) {
+        scan(fullPath);
+      } else {
+        allFiles.push(fullPath);
+      }
     }
   };
   scan(dirPath);
@@ -85,49 +103,52 @@ function getVFSState(
   return state;
 }
 
-const PACKAGE_DOWNLOAD_DOMAINS = [
-  "cdn.jsdelivr.net:443",
-  "pypi.org:443",
-  "files.pythonhosted.org:443",
-];
-
-export interface PackagePermissions {
-  isNetworkDisabled: boolean;
-  isRuntimePackagesDisabled: boolean;
-}
-
 export async function readPackagePermissions(): Promise<PackagePermissions> {
   const netPermissions = await Promise.all(
     PACKAGE_DOWNLOAD_DOMAINS.map((host) =>
       Deno.permissions.query({ name: "net", host })
     )
   );
+
   const cacheDir = Deno.env.get("PACKAGE_CACHE_DIR");
   const writePerms = cacheDir
     ? await Deno.permissions.query({ name: "write", path: cacheDir })
     : null;
+
   return {
     isNetworkDisabled: netPermissions.every((perm) => perm.state !== "granted"),
     isRuntimePackagesDisabled: !writePerms || writePerms.state !== "granted",
   };
 }
 
+const ConfigureSchemaShape = {
+  globals: z.record(z.any()).optional(),
+  mounts: z.record(z.string()).optional(),
+  input_dir: z.string().optional(),
+  output_dir: z.string().optional(),
+  tools: z.array(z.string()).optional(),
+  proxy_tools: z.array(z.string()).optional(),
+  packages: z.array(z.string()).optional(),
+  disable_net: z.boolean().optional().default(false),
+  disable_runtime_packages: z.boolean().optional().default(false),
+};
+
+const ConfigureSchema = z.object(ConfigureSchemaShape);
+
+const ExecuteSchemaShape = {
+  code: z.string(),
+  timeout: z.number().optional(),
+  auto_load_packages: z.boolean().optional().default(false),
+};
+
+const ExecuteSchema = z.object(ExecuteSchemaShape);
+
 const configureSandboxTool: Tool = {
   name: "configure",
   config: {
     title: "Configure Python Sandbox.",
     description: "Configure Python Sandbox.",
-    inputSchema: {
-      globals: z.record(z.any()).optional(),
-      mounts: z.record(z.string()).optional(),
-      input_dir: z.string().optional(),
-      output_dir: z.string().optional(),
-      tools: z.array(z.string()).optional(),
-      proxy_tools: z.array(z.string()).optional(),
-      packages: z.array(z.string()).optional(),
-      disable_net: z.boolean().optional().default(false),
-      disable_runtime_packages: z.boolean().optional().default(false),
-    },
+    inputSchema: ConfigureSchemaShape,
     outputSchema: {
       is_success: z.boolean(),
       error_code: z
@@ -136,7 +157,9 @@ const configureSandboxTool: Tool = {
       error: z.string().optional(),
     },
   },
-  handler: async ({ pyodide, WORK_DIR }, args) => {
+  handler: async ({ pyodide, WORK_DIR }, rawArgs) => {
+    const args = ConfigureSchema.parse(rawArgs);
+
     try {
       if (args.globals) {
         for (const [key, value] of Object.entries(args.globals)) {
@@ -181,12 +204,12 @@ const configureSandboxTool: Tool = {
         const createCallback = pyodide.globals.get("_create_host_callback");
         const DynamicProxyClass = pyodide.globals.get("_DynamicProxy");
 
-        (args.tools ?? []).forEach((name: string) => {
+        args.tools?.forEach((name) => {
           const callbackFunc = createCallback(name);
           pyodide.globals.set(name, callbackFunc);
         });
 
-        (args.proxy_tools ?? []).forEach((name: string) => {
+        args.proxy_tools?.forEach((name) => {
           pyodide.globals.set(name, DynamicProxyClass(name));
         });
       }
@@ -239,11 +262,7 @@ const executePythonTool: Tool = {
   config: {
     title: "Execute Python Code",
     description: "Executes Python code.",
-    inputSchema: {
-      code: z.string(),
-      timeout: z.number().optional(),
-      auto_load_packages: z.boolean().optional().default(false),
-    },
+    inputSchema: ExecuteSchemaShape,
     outputSchema: {
       is_success: z.boolean(),
       result: z.any().optional(),
@@ -254,10 +273,8 @@ const executePythonTool: Tool = {
         .optional(),
     },
   },
-  handler: async (
-    { pyodide, WORK_DIR },
-    { code, timeout, auto_load_packages }
-  ) => {
+  handler: async ({ pyodide, WORK_DIR }, rawArgs) => {
+    const { code, timeout, auto_load_packages } = ExecuteSchema.parse(rawArgs);
     let timeoutId: number | undefined;
 
     try {
@@ -283,7 +300,7 @@ const executePythonTool: Tool = {
           executionPromise,
           new Promise((_, reject) => {
             timeoutId = setTimeout(() => {
-              Atomics.store(interruptBuffer, 0, 2); // SIGINT
+              Atomics.store(interruptBuffer, 0, 2);
               reject(new Error(`Execution timed out after ${timeout} seconds`));
             }, timeout * 1000);
           }),
@@ -292,9 +309,9 @@ const executePythonTool: Tool = {
         resultProxy = await executionPromise;
       }
 
-      const result =
-        resultProxy?.toJs?.({ dict_converter: Object.fromEntries }) ??
-        resultProxy; // TODO: robust serialize outputs
+      const robustSerialize = pyodide.globals.get("robust_serialize");
+      const jsonStr = robustSerialize(resultProxy);
+      const result = JSON.parse(jsonStr);
 
       const output_files: string[] = [];
       const filesAfter = getVFSState(pyodide, WORK_DIR);
@@ -316,14 +333,15 @@ const executePythonTool: Tool = {
         content: [{ type: "text", text: JSON.stringify({ result }, null, 2) }],
       };
     } catch (error: any) {
-      const { code, message } = formatError(error);
-      const isSystemError = code === "TIMEOUT" || code === "PERMISSION_DENIED";
+      const { code: errorCode, message } = formatError(error);
+      const isSystemError =
+        errorCode === "TIMEOUT" || errorCode === "PERMISSION_DENIED";
 
       return {
         structuredContent: {
           is_success: false,
           error: message,
-          error_code: code,
+          error_code: errorCode,
         },
         content: [{ type: "text", text: message }],
         isError: isSystemError,
