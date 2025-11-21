@@ -144,10 +144,13 @@ class PythonSandbox:
         args.append(f"--allow-read={','.join(sorted(set(read_only_paths)))}")
         args.append(f"--allow-write={','.join(sorted(set(read_write_paths)))}")
 
-        allowed_domains = PACKAGE_DOWNLOAD_DOMAINS.copy()
-        if isinstance(self.allow_net, list):
-            allowed_domains.update(self.allow_net)
-        args.append(f"--allow-net={','.join(sorted(list(allowed_domains)))}")
+        if self.allow_net is True:
+            args.append("--allow-net")
+        else:
+            allowed_domains = set(PACKAGE_DOWNLOAD_DOMAINS)
+            if isinstance(self.allow_net, list):
+                allowed_domains.update(self.allow_net)
+            args.append(f"--allow-net={','.join(sorted(list(allowed_domains)))}")
 
         args.append(f"--v8-flags=--max-old-space-size={self.memory_limit}")
         args.append("--allow-env")
