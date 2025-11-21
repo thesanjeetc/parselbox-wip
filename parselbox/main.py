@@ -113,7 +113,6 @@ class PythonSandbox:
         self.mounts = mounts or {}
         if isinstance(self.mounts, list):
             self.mounts = {Path(f).name: f for f in self.mounts}
-        self.mounts["files"] = self.input_dir
 
         self.auto_load_packages = auto_load_packages
         self.allow_net = allow_net
@@ -192,16 +191,15 @@ class PythonSandbox:
         await self.initialize()
 
     async def initialize(self):
-        disable_net = (not bool(self.allow_net)) and (not self.auto_load_packages)
-
         await self._configure(
             globals=self.globals,
             mounts=self.mounts,
+            input_dir=self.input_dir,
             output_dir=self.output_dir,
-            tools=self.tools,
-            proxy_tools=self.proxy_tools,
+            tools=list(self.tools.keys()),
+            proxy_tools=list(self.proxy_tools.keys()),
             packages=self.packages,
-            disable_net=disable_net,
+            disable_net=(not bool(self.allow_net)) and (not self.auto_load_packages),
             disable_runtime_packages=not self.auto_load_packages,
         )
         await self.upload_files(self.files)
@@ -259,27 +257,24 @@ class PythonSandbox:
             if "Connection closed" in str(e) or "closed" in str(e).lower():
                 raise SandboxRuntimeError(f"Sandbox crashed or connection closed: {e}")
             raise SandboxError(f"Communication error: {e}")
+        content = result.structured_content
         if result.is_error:
-            if result.structured_content and "error_code" in result.structured_content:
-                self._raise_for_error(result.structured_content)
+            if content and "error_code" in content:
+                code = content.get("error_code")
+                msg = content.get("error", "Unknown Error")
+                if code == "TIMEOUT":
+                    raise SandboxTimeoutError(msg)
+                if code == "PERMISSION_DENIED":
+                    raise SandboxPermissionError(msg)
             error_text = result.content[0].text if result.content else "Unknown error"
             raise SandboxError(f"MCP Protocol Error: {error_text}")
-        return result.structured_content
-
-    def _raise_for_error(self, content: Dict[str, Any]):
-        """Inspects the structured content and raises specific exceptions."""
-        code = content.get("error_code")
-        msg = content.get("error", "Unknown Error")
-
-        if code == "TIMEOUT":
-            raise SandboxTimeoutError(msg)
-        if code == "PERMISSION_DENIED":
-            raise SandboxPermissionError(msg)
+        return content
 
     async def _configure(
         self,
         globals=None,
         mounts=None,
+        input_dir=None,
         output_dir=None,
         tools=None,
         proxy_tools=None,
@@ -287,31 +282,18 @@ class PythonSandbox:
         disable_net=None,
         disable_runtime_packages=None,
     ) -> Dict[str, Any]:
-        payload = {}
-        if globals:
-            payload["globals"] = globals
-
-        if output_dir:
-            payload["output_dir"] = output_dir
-
-        if mounts:
-            payload["mounts"] = mounts
-
-        if tools:
-            payload["tools"] = list(tools.keys())
-
-        if proxy_tools:
-            payload["proxy_tools"] = list(proxy_tools.keys())
-
-        if packages:
-            payload["packages"] = packages
-
-        if disable_net is not None:
-            payload["disable_net"] = disable_net
-
-        if disable_runtime_packages is not None:
-            payload["disable_runtime_packages"] = disable_runtime_packages
-
+        payload = {
+            "globals": globals,
+            "mounts": mounts,
+            "input_dir": input_dir,
+            "output_dir": output_dir,
+            "tools": tools,
+            "proxy_tools": proxy_tools,
+            "packages": packages,
+            "disable_net": disable_net,
+            "disable_runtime_packages": disable_runtime_packages,
+        }
+        payload = {k: v for k, v in payload.items() if v is not None}
         result = await self._call_mcp("configure", payload)
         if not result.get("is_success"):
             self._raise_for_error(result)

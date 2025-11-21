@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 import shutil
-from client import PythonSandbox, Callback
+from parselbox import PythonSandbox, Callback
 from PIL import Image, ImageDraw, ImageFont
 import httpx
 

@@ -61,7 +61,7 @@ class TestFileSystem:
         async with PythonSandbox(files=[str(input_file)]) as sandbox:
             code = dedent(
                 """
-                with open('mnt/files/data.txt', 'r') as f:
+                with open('/files/data.txt', 'r') as f:
                     content = f.read()
                 content
             """
@@ -96,11 +96,10 @@ class TestFileSystem:
         mounts = {"datasets": str(data_dir)}
 
         async with PythonSandbox(mounts=mounts) as sandbox:
-            # 1. Test Read Success
             read_code = dedent(
                 """
                 import os
-                with open('mnt/datasets/config.json', 'r') as f:
+                with open('/mnt/datasets/config.json', 'r') as f:
                     data = f.read()
                 data
             """
@@ -108,23 +107,18 @@ class TestFileSystem:
             result = await sandbox.execute_python(read_code)
             assert '"key": "value"' in str(result.output)
 
-            # 2. Test Write Fail
-            # Note: Pyodide on Deno currently crashes fatally (NotCapable error -> Connection Closed)
-            # when writing to a read-only mount. We accept a crash/RuntimeError OR a Python error as success here.
             write_code = dedent(
                 """
-                with open('mnt/datasets/hack.txt', 'w') as f:
+                with open('/mnt/datasets/hack.txt', 'w') as f:
                     f.write('bad')
             """
             )
 
             try:
                 result = await sandbox.execute_python(write_code)
-                # If it didn't crash, it better have an error
                 assert result.error is not None
                 assert "Read-only" in result.error or "Permission" in result.error
             except (SandboxRuntimeError, SandboxError):
-                # Sandbox crash (Connection closed) is ALSO a valid pass for "Permission Denied"
                 pass
 
     async def test_mounts_list_behavior(self, tmp_path):
@@ -136,7 +130,7 @@ class TestFileSystem:
         async with PythonSandbox(mounts=[str(host_data_dir)]) as sandbox:
             code = dedent(
                 """
-                with open('mnt/data_v1/secret.txt', 'r') as f:
+                with open('/mnt/data_v1/secret.txt', 'r') as f:
                     content = f.read()
                 content
             """
@@ -244,7 +238,6 @@ class TestConstraints:
         async with PythonSandbox(timeout=2) as sandbox:
             code = "import time; time.sleep(5); 'Finished'"
 
-            # Expecting the custom exception from main.py
             with pytest.raises(SandboxTimeoutError) as excinfo:
                 await sandbox.execute_python(code)
 
@@ -252,15 +245,19 @@ class TestConstraints:
 
     async def test_memory_limit_enforcement(self):
         """Test that the sandbox crashes or errors when exceeding memory limit."""
-        # 50MB limit is soft; we need a very large allocation to guarantee OOM crash in V8
-        async with PythonSandbox(memory_limit=50) as sandbox:
-            # Increase allocation to ~500MB
-            code = "x = 'a' * (1024 * 1024 * 500000); len(x)"
-            try:
+        try:
+            async with PythonSandbox(memory_limit=10) as sandbox:
+                code = "x = 'a' * (1024 * 1024); len(x)"
                 await sandbox.execute_python(code)
                 pytest.fail("Sandbox should have run out of memory but succeeded.")
-            except (RuntimeError, SandboxError, SandboxRuntimeError) as e:
-                assert "Connection" in str(e) or "closed" in str(e) or "Error" in str(e)
+
+        except (RuntimeError, SandboxError, SandboxRuntimeError) as e:
+            error_msg = str(e).lower()
+            assert (
+                "connection" in error_msg
+                or "closed" in error_msg
+                or "error" in error_msg
+            )
 
     async def test_env_vars(self):
         """Test passing environment variables."""

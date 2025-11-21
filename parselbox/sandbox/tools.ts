@@ -57,7 +57,7 @@ function listFilesRecursive(
   const allFiles: string[] = [];
   const scan = (currentPath: string) => {
     for (const entry of pyodide.FS.readdir(currentPath)) {
-      if (entry === "." || entry === ".." || entry === "mnt") continue;
+      if (entry === "." || entry === "..") continue;
       const fullPath = path.join(currentPath, entry);
       if (pyodide.FS.isDir(pyodide.FS.stat(fullPath).mode)) scan(fullPath);
       else allFiles.push(fullPath);
@@ -120,6 +120,7 @@ const configureSandboxTool: Tool = {
     inputSchema: {
       globals: z.record(z.any()).optional(),
       mounts: z.record(z.string()).optional(),
+      input_dir: z.string().optional(),
       output_dir: z.string().optional(),
       tools: z.array(z.string()).optional(),
       proxy_tools: z.array(z.string()).optional(),
@@ -151,8 +152,18 @@ const configureSandboxTool: Tool = {
         );
       }
 
+      if (args.input_dir) {
+        const filesRoot = "/files";
+        pyodide.FS.mkdirTree(filesRoot);
+        pyodide.FS.mount(
+          pyodide.FS.filesystems.NODEFS,
+          { root: args.input_dir },
+          filesRoot
+        );
+      }
+
       if (args.mounts && Object.keys(args.mounts).length > 0) {
-        const mountRoot = path.join(WORK_DIR, "mnt");
+        const mountRoot = "/mnt";
         pyodide.FS.mkdirTree(mountRoot);
 
         for (const [name, hostPath] of Object.entries(args.mounts)) {
