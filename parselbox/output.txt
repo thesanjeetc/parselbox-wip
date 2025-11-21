@@ -1,0 +1,1028 @@
+Repository Documentation
+This document provides a comprehensive overview of the repository's structure and contents.
+The first section, titled 'Directory/File Tree', displays the repository's hierarchy in a tree format.
+In this section, directories and files are listed using tree branches to indicate their structure and relationships.
+Following the tree representation, the 'File Content' section details the contents of each file in the repository.
+Each file's content is introduced with a '[File Begins]' marker followed by the file's relative path,
+and the content is displayed verbatim. The end of each file's content is marked with a '[File Ends]' marker.
+This format ensures a clear and orderly presentation of both the structure and the detailed contents of the repository.
+
+Directory/File Tree Begins -->
+
+parselbox/
+├── __init__.py
+├── __pycache__
+│   ├── __init__.cpython-313.pyc
+│   ├── codemode.cpython-313.pyc
+│   └── main.cpython-313.pyc
+├── codemode.py
+├── main.py
+├── mcp.py
+└── sandbox
+    ├── deno.jsonc
+    ├── sandbox.ts
+    └── tools.ts
+
+<-- Directory/File Tree Ends
+
+File Content Begin -->
+[File Begins] __init__.py
+from .main import PythonSandbox, Callback, Result
+from .codemode import CodeMode
+
+__all__ = ["PythonSandbox", "Callback", "Result", "CodeMode"]
+
+[File Ends] __init__.py
+
+[File Begins] codemode.py
+from .main import PythonSandbox, Callback
+from fastmcp import Client
+from jsonschema import validate
+import json
+
+
+# auto load mcps from claude_desktop_config.json, mcp.json, .mcp.json, etc.
+
+
+class CodeMode:
+    def __init__(self, config, sandbox=None):
+        self.internal_sandbox = False
+        if not sandbox:
+            self.internal_sandbox = True
+            sandbox = PythonSandbox()
+        self.sandbox = sandbox
+        self.client = Client(config)
+        self.servers = list(config["mcpServers"].keys())
+        self.sandbox.proxy_tools |= {k: self.handle_tool for k in self.servers}
+        self.tool_schemas = {}
+
+    async def handle_tool(self, callback: Callback):
+        server_name = callback.name
+        tool_name = callback.path[0]
+        mcp_tool = f"{server_name}_{tool_name}" if len(self.servers) > 1 else tool_name
+        tool_schema = self.tool_schemas[tool_name]
+        schema_props = list(tool_schema["properties"].keys())
+        tool_params = {**dict(zip(schema_props, callback.args)), **callback.kwargs}
+        validate(instance=tool_params, schema=tool_schema)
+        result = await self.client.call_tool_mcp(mcp_tool, callback.kwargs)
+        content = json.loads(result.content[0].text)
+        # TODO: try json else return plain text
+        if result.isError:
+            raise Exception(content)
+        return content
+
+    async def load_tool_schemas(self):
+        tools = await self.client.list_tools()
+        for tool in tools:
+            self.tool_schemas[tool.name] = tool.inputSchema
+
+    async def __aenter__(self):
+        await self.sandbox.__aenter__()
+        await self.client.__aenter__()
+        await self.load_tool_schemas()
+        return self.sandbox
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.internal_sandbox:
+            await self.sandbox.__aexit__(exc_type, exc_val, exc_tb)
+        await self.client.__aexit__(exc_type, exc_val, exc_tb)
+
+    def __getattr__(self, name):
+        return getattr(self.sandbox, name)
+
+[File Ends] codemode.py
+
+[File Begins] main.py
+import asyncio
+import inspect
+import json
+import os
+import shutil
+import tempfile
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional, Union
+
+from pathlib import Path
+from fastmcp import Client
+from fastmcp.client.transports import StdioTransport
+import subprocess
+
+
+@dataclass
+class Callback:
+    type: Literal["callback", "proxy_callback"]
+    name: str
+    args: List[Any]
+    kwargs: Dict[str, Any]
+    path: Optional[List[str]] = field(default_factory=list)
+
+
+@dataclass
+class Result:
+    output: Any
+    files: List[str] = field(default_factory=list)
+    error: Optional[str] = None
+
+
+DENO_SCRIPT_PATH = str(Path(__file__).parent.resolve() / "sandbox" / "sandbox.ts")
+
+PACKAGE_DOWNLOAD_DOMAINS = [
+    "cdn.jsdelivr.net:443",
+    "pypi.org:443",
+    "files.pythonhosted.org:443",
+]
+
+
+class PythonSandbox:
+    def __init__(
+        self,
+        tools: Union[List[callable], Dict[str, callable]] = None,
+        proxy_tools: Optional[Dict[str, callable]] = None,
+        files: Optional[List[str]] = None,
+        mounts: Optional[List[str] | Dict[str, str]] = None,
+        output_dir: Optional[str] = None,
+        allow_net: Union[bool, List[str]] = False,
+        packages: Optional[List[str]] = None,
+        auto_load_packages: bool = False,
+        globals: Optional[Dict[str, Any]] = None,
+        env: Optional[Dict[str, Any]] = None,
+        deno_path: str = "deno",
+        log_handler: Optional[callable] = None,
+        memory_limit: int = 512,
+        timeout: int = 60,
+    ):
+        self.deno_path = deno_path
+
+        try:
+            subprocess.run(
+                [self.deno_path, "--version"], capture_output=True, check=True
+            )
+        except (subprocess.SubprocessError, FileNotFoundError):
+            raise RuntimeError(
+                "Deno not found on PATH. Please install Deno from https://deno.land/."
+            )
+
+        self.tools = (
+            {f.__name__: f for f in tools} if isinstance(tools, list) else (tools or {})
+        )
+        self.proxy_tools = proxy_tools or {}
+
+        self.persistent_cache_root = Path.home() / ".cache" / "parselbox"
+        self.deno_cache_dir = str(self.persistent_cache_root / "deno_core")
+        os.makedirs(self.deno_cache_dir, exist_ok=True)
+
+        self.temp_output_dir = tempfile.TemporaryDirectory() if not output_dir else None
+        self.output_dir = output_dir or self.temp_output_dir.name
+
+        self.cache_dir = tempfile.TemporaryDirectory()
+        self.package_cache_dir = str(Path(self.cache_dir.name) / "package_cache_dir")
+        self.input_dir = str(Path(self.cache_dir.name) / "files")
+        os.makedirs(self.input_dir, exist_ok=True)
+
+        self.files = files or []
+
+        self.mounts = mounts or {}
+        if isinstance(self.mounts, list):
+            self.mounts = {Path(f).name: f for f in self.mounts}
+        self.mounts["files"] = self.input_dir
+
+        self.auto_load_packages = auto_load_packages
+        self.allow_net = allow_net
+        self.globals = globals or {}
+
+        self.env = env or {}
+        if isinstance(env, list):
+            self.env = {var: os.environ[var] for var in env if var in os.environ}
+
+        self.packages = packages or []
+        self.log_handler = log_handler
+        self.memory_limit = memory_limit
+        self.timeout = timeout
+
+        self.client: Client = None
+
+    def _build_deno_args(self) -> List[str]:
+        args = ["run"]
+
+        read_write_paths = [
+            self.output_dir,
+            self.deno_cache_dir,
+            self.package_cache_dir,
+        ]
+
+        read_only_paths = [*self.mounts.values(), self.input_dir]
+        read_only_paths.extend(read_write_paths)
+
+        args.append(f"--allow-read={','.join(sorted(set(read_only_paths)))}")
+        args.append(f"--allow-write={','.join(sorted(set(read_write_paths)))}")
+
+        allowed_domains = PACKAGE_DOWNLOAD_DOMAINS.copy()
+        if isinstance(self.allow_net, list):
+            allowed_domains.update(self.allow_net)
+        args.append(f"--allow-net={','.join(sorted(list(allowed_domains)))}")
+
+        args.append(f"--v8-flags=--max-old-space-size={self.memory_limit}")
+        args.append("--allow-env")
+
+        args.append(DENO_SCRIPT_PATH)
+        return args
+
+    def is_connected(self):
+        return self.client and self.client.is_connected()
+
+    async def connect(self):
+        if self.is_connected():
+            return
+
+        deno_args = self._build_deno_args()
+
+        self.env["PACKAGE_CACHE_DIR"] = self.package_cache_dir
+        self.env["DENO_DIR"] = self.deno_cache_dir
+        self.env["MPLBACKEND"] = "Agg"
+
+        transport = StdioTransport(
+            command=self.deno_path,
+            args=deno_args,
+            env=self.env,
+        )
+
+        self.client = Client(
+            transport,
+            elicitation_handler=self._handle_callback,
+            log_handler=self.log_handler,
+        )
+
+        try:
+            await self.client.__aenter__()
+            if self.log_handler:
+                await self.client.set_logging_level("info")
+        except Exception as e:
+            await self.close()
+            raise RuntimeError(e) from e
+
+        await self.initialize()
+
+    async def initialize(self):
+        await self._configure(
+            globals=self.globals,
+            mounts=self.mounts,
+            output_dir=self.output_dir,
+            tools=self.tools,
+            proxy_tools=self.proxy_tools,
+            packages=self.packages,
+            disable_net=not bool(self.allow_net),
+            disable_runtime_packages=not self.auto_load_packages,
+        )
+        await self.upload_files(self.files)
+
+    async def close(self):
+        if not self.is_connected():
+            return
+        if self.client:
+            await self.client.__aexit__(None, None, None)
+        self.cache_dir.cleanup()
+        if self.temp_output_dir:
+            self.temp_output_dir.cleanup()
+        self.client = None
+
+    async def __aenter__(self):
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+
+    async def _handle_callback(
+        self, callback_str: str, response_type, params: Any, context: Any
+    ):
+        try:
+            callback = Callback(**json.loads(callback_str))
+            if callback.type == "callback":
+                func = self.tools[callback.name]
+                output = (
+                    await func(*callback.args, **callback.kwargs)
+                    if inspect.iscoroutinefunction(func)
+                    else func(*callback.args, **callback.kwargs)
+                )
+            elif callback.type == "proxy_callback":
+                handler = self.proxy_tools[callback.name]
+                output = (
+                    await handler(callback)
+                    if inspect.iscoroutinefunction(handler)
+                    else handler(callback)
+                )
+            return response_type(result=json.dumps(output))
+        except Exception as e:
+            error_payload = {
+                "__error__": str(e),
+                "__error_type__": type(e).__name__,
+            }
+            return response_type(result=json.dumps(error_payload))
+
+    async def _call_mcp(self, name, payload):
+        if not self.is_connected():
+            raise RuntimeError("Sandbox is not connected.")
+        result = await self.client.call_tool(name, payload, raise_on_error=False)
+        if result.is_error:
+            raise RuntimeError(result.content[0].text)
+        return result.structured_content
+
+    async def _configure(
+        self,
+        globals=None,
+        mounts=None,
+        output_dir=None,
+        tools=None,
+        proxy_tools=None,
+        packages: List[str] = None,
+        disable_net=None,
+        disable_runtime_packages=None,
+    ) -> Dict[str, Any]:
+        payload = {}
+        if globals:
+            payload["globals"] = globals
+
+        if output_dir:
+            payload["output_dir"] = output_dir
+
+        if mounts:
+            payload["mounts"] = mounts
+
+        if tools:
+            payload["tools"] = list(tools.keys())
+
+        if proxy_tools:
+            payload["proxy_tools"] = list(proxy_tools.keys())
+
+        if packages:
+            payload["packages"] = packages
+
+        if disable_net is not None:
+            payload["disable_net"] = disable_net
+
+        if disable_runtime_packages is not None:
+            payload["disable_runtime_packages"] = disable_runtime_packages
+
+        result = await self._call_mcp("configure", payload)
+        return result
+
+    async def upload_files(self, files: List[str]):
+        if not files:
+            return
+
+        def _copy_sync(path: str):
+            target_path = Path(path).resolve()
+            if not target_path.is_file():
+                return
+
+            mount_path = Path(self.input_dir) / target_path.name
+
+            if mount_path.exists():
+                mount_path.unlink()
+
+            try:
+                os.link(target_path, mount_path)
+            except (OSError, AttributeError):
+                shutil.copy2(target_path, mount_path)
+
+        loop = asyncio.get_running_loop()
+        tasks = [loop.run_in_executor(None, _copy_sync, f) for f in files]
+        await asyncio.gather(*tasks)
+
+    async def execute_python(
+        self, code: str, files: Optional[List[str]] = None
+    ) -> Result:
+        await self.upload_files(files)
+        payload = {
+            "code": code,
+            "timeout": self.timeout,
+            "auto_load_packages": self.auto_load_packages,
+        }
+        result = await self._call_mcp("execute_python", payload)
+        files = [os.path.join(self.output_dir, f) for f in result.get("files", [])]
+
+        return Result(
+            output=result.get("result"),
+            files=files,
+            error=result.get("error"),
+        )
+
+
+async def run():
+    sandbox = PythonSandbox()
+    print(sandbox._build_deno_args())
+    # mcp = FastMCP(name="PythonSandbox")
+    # tools = {Tool.from_function(fn=sandbox.execute_python)}
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
+
+[File Ends] main.py
+
+[File Begins] mcp.py
+
+[File Ends] mcp.py
+
+  [File Begins] sandbox/deno.jsonc
+  {
+    "imports": {
+      "@modelcontextprotocol/sdk": "npm:@modelcontextprotocol/sdk@^1.21.1",
+      "fastmcp": "npm:fastmcp",
+      "pyodide": "npm:pyodide",
+      "zod": "npm:zod"
+    }
+  }
+
+  [File Ends] sandbox/deno.jsonc
+
+  [File Begins] sandbox/sandbox.ts
+  // sandbox.ts
+  
+  import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+  import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+  import { loadPyodide } from "pyodide";
+  import { type ToolContext, TOOLS } from "./tools.ts";
+  import {
+    type LoggingLevel,
+    SetLevelRequestSchema,
+  } from "@modelcontextprotocol/sdk/types.js";
+  
+  const deno_dir = Deno.env.get("DENO_DIR");
+  await Deno.permissions.revoke({ name: "write", path: deno_dir });
+  
+  const WORK_DIR = "/workspace";
+  
+  const PY_SETUP = `
+  import json
+  import datetime
+  import builtins
+  
+  async def _host_rpc_call(payload_dict):
+      payload_str = json.dumps(payload_dict)
+      result_str = await _js_host_rpc_bridge(payload_str)
+      result_obj = json.loads(result_str)
+      if isinstance(result_obj, dict) and "__error__" in result_obj:
+          error_type_name = result_obj.get("__error_type__", "Exception")
+          error_message = result_obj.get("__error__", "An unknown error occurred in the host callback.")
+          exception_class = getattr(builtins, error_type_name, Exception)
+          raise exception_class(f"Host callback failed: {error_message}")
+      return result_obj
+  
+  def _create_host_callback(name):
+      async def callback(*args, **kwargs):
+          return await _host_rpc_call({
+              "type": "callback",
+              "name": name,
+              "args": args,
+              "kwargs": kwargs
+          })
+      callback.__name__ = name
+      return callback
+  
+  class _DynamicProxy:
+      def __init__(self, root_name, path_parts=None):
+          self._root_name = root_name
+          self._path_parts = path_parts or []
+  
+      def __getattr__(self, name):
+          new_path = self._path_parts + [name]
+          return _DynamicProxy(self._root_name, new_path)
+  
+      async def __call__(self, *args, **kwargs):
+          return await _host_rpc_call({
+              "type": "proxy_callback",
+              "name": self._root_name,
+              "path": self._path_parts,
+              "args": args,
+              "kwargs": kwargs
+          })
+  
+  class AttrDict:
+      def __init__(self, data):
+          self._data = {}
+          for key, value in data.items():
+              self._data[key] = self._wrap(value)
+      def keys(self): return self._data.keys()
+      def values(self): return self._data.values()
+      def items(self): return self._data.items()
+      def _wrap(self, value):
+          if isinstance(value, dict): return AttrDict(value)
+          if isinstance(value, list): return [self._wrap(item) for item in value]
+          return value
+      def __getattr__(self, name):
+          try: return self._data[name]
+          except KeyError: raise AttributeError(f"'AttrDict' object has no attribute '{name}'")
+      def __getitem__(self, key): return self._data[key]
+      def __repr__(self): return f"AttrDict({self._data})"
+  
+  def _js_convert(res):
+      if not hasattr(res, 'to_py'): return res
+      return AttrDict(res.to_py())
+  
+  def serialize_py(obj) -> str:
+    def _robust_serialize(obj, seen=None):
+        if seen is None:
+            seen = set()
+  
+        obj_id = id(obj)
+        if obj_id in seen:
+            return {"type": "circular_reference", "repr": repr(obj)}
+        seen.add(obj_id)
+  
+        if isinstance(obj, (str, int, float, bool, type(None))):
+            return obj
+  
+        if isinstance(obj, (list, tuple, set, frozenset)):
+            return [_robust_serialize(item, seen) for item in obj]
+  
+        if isinstance(obj, dict):
+            return {str(key): _robust_serialize(value, seen) for key, value in obj.items()}
+  
+        if isinstance(obj, (datetime.date, datetime.datetime)):
+            return obj.isoformat()
+  
+        return {"type": "not_serializable", "repr": repr(obj)}
+  
+    serialized_result = _robust_serialize(obj)
+    return json.dumps(serialized_result, indent=2)
+  `;
+  
+  const LogLevels: LoggingLevel[] = [
+    "debug",
+    "info",
+    "notice",
+    "warning",
+    "error",
+    "critical",
+    "alert",
+    "emergency",
+  ];
+  
+  function createServerLogger(
+    mcpServer: McpServer,
+    getLogLevel: () => LoggingLevel
+  ) {
+    const log = (level: LoggingLevel, context: string, data: string | Error) => {
+      if (LogLevels.indexOf(level) >= LogLevels.indexOf(getLogLevel())) {
+        const message = data instanceof Error ? data.stack ?? data.message : data;
+        mcpServer.server.sendLoggingMessage({
+          level,
+          data: `[SANDBOX:(${context.toUpperCase()})] ${message}`,
+        });
+      }
+    };
+  
+    return {
+      debug: (context: string, data: string | Error) =>
+        log("debug", context, data),
+      info: (context: string, data: string | Error) => log("info", context, data),
+      warn: (context: string, data: string | Error) =>
+        log("warning", context, data),
+      error: (context: string, data: string | Error) =>
+        log("error", context, data),
+    };
+  }
+  
+  async function main() {
+    const mcpServer = new McpServer(
+      {
+        name: "pyodide-sandbox-server-deno",
+        version: "1.0.0",
+      },
+      {
+        capabilities: {
+          logging: {},
+        },
+      }
+    );
+  
+    let setLogLevel: LoggingLevel = "info";
+    const logger = createServerLogger(mcpServer, () => setLogLevel);
+  
+    mcpServer.server.setRequestHandler(SetLevelRequestSchema, (request) => {
+      setLogLevel = request.params.level;
+      logger.info("deno", `Log level set to: ${setLogLevel}`);
+      return {};
+    });
+  
+    const env = Deno.env.toObject();
+    const packageCacheDir = Deno.env.get("PACKAGE_CACHE_DIR");
+  
+    const pyodide = await loadPyodide({
+      env: env,
+      packageCacheDir: packageCacheDir,
+      stdout: (msg: string) => {
+        logger.info("pyodide.stdout", msg);
+      },
+      stderr: (msg: string) => {
+        logger.warn("pyodide.stderr", msg);
+      },
+    });
+  
+    const origLoadPackage = pyodide.loadPackage;
+    pyodide.loadPackage = (pkgs, options) =>
+      origLoadPackage(pkgs, {
+        messageCallback: (msg: string) => {
+          logger.debug("pyodide.pip", msg);
+        },
+        errorCallback: (msg: string) => {
+          logger.error("pyodide.pip", `install error: ${msg}`);
+        },
+        ...options,
+      });
+  
+    pyodide.FS.mkdir(WORK_DIR);
+    pyodide.runPython(`import os; os.chdir('${WORK_DIR}')`);
+  
+    await pyodide.runPythonAsync(PY_SETUP);
+  
+    const jsHostRPCBridge = async (payloadStr: string): Promise<string> => {
+      const response = await mcpServer.server.elicitInput({
+        message: payloadStr,
+        requestedSchema: {
+          type: "object",
+          properties: { result: { type: "string" } },
+        },
+      });
+  
+      if (response.action === "accept" && response.content) {
+        return response.content.result;
+      } else {
+        throw new Error(`Host call rejected or failed: ${response.action}`);
+      }
+    };
+  
+    pyodide.globals.set("_js_host_rpc_bridge", jsHostRPCBridge);
+  
+    const context: ToolContext = { pyodide, mcpServer, WORK_DIR };
+  
+    for (const tool of TOOLS) {
+      mcpServer.registerTool(tool.name, tool.config, (args) =>
+        tool.handler(context, args)
+      );
+    }
+  
+    const transport = new StdioServerTransport();
+    await mcpServer.connect(transport);
+    logger.info("deno", "Server connected. Ready for requests.");
+  }
+  
+  main().catch((err) => {
+    console.error("An unrecoverable error occurred:", err);
+    Deno.exit(1);
+  });
+
+  [File Ends] sandbox/sandbox.ts
+
+  [File Begins] sandbox/tools.ts
+  import { z } from "zod";
+  import * as path from "https://deno.land/std/path/mod.ts";
+  import type {
+    McpServer,
+    McpToolConfig,
+    McpToolResult,
+  } from "@modelcontextprotocol/sdk/server/mcp.js";
+  import type { PyodideInterface } from "pyodide";
+  
+  export interface ToolContext {
+    pyodide: PyodideInterface;
+    mcpServer: McpServer;
+    WORK_DIR: string;
+    logger: ReturnType<typeof createServerLogger>;
+  }
+  
+  export interface Tool {
+    name: string;
+    config: McpToolConfig;
+    handler: (context: ToolContext, args: any) => Promise<McpToolResult>;
+  }
+  
+  function listFilesRecursive(
+    pyodide: PyodideInterface,
+    dirPath: string,
+  ): string[] {
+    const allFiles: string[] = [];
+    const scan = (currentPath: string) => {
+      for (const entry of pyodide.FS.readdir(currentPath)) {
+        if (entry === "." || entry === ".." || entry === "mnt") continue;
+        const fullPath = path.join(currentPath, entry);
+        if (pyodide.FS.isDir(pyodide.FS.stat(fullPath).mode)) scan(fullPath);
+        else allFiles.push(fullPath);
+      }
+    };
+    scan(dirPath);
+    return allFiles;
+  }
+  
+  function getVFSState(
+    pyodide: PyodideInterface,
+    dirPath: string,
+  ): Map<string, number> {
+    const state = new Map<string, number>();
+    const allFiles = listFilesRecursive(pyodide, dirPath);
+  
+    for (const filePath of allFiles) {
+      try {
+        const stats = pyodide.FS.stat(filePath);
+        state.set(filePath, stats.mtime.getTime());
+      } catch (e) {
+        console.warn(`Could not stat file ${filePath}:`, e);
+      }
+    }
+    return state;
+  }
+  
+  const PACKAGE_DOWNLOAD_DOMAINS = [
+    "cdn.jsdelivr.net:443",
+    "pypi.org:443",
+    "files.pythonhosted.org:443",
+  ];
+  
+  export interface PackagePermissions {
+    isNetworkDisabled: boolean;
+    isRuntimePackagesDisabled: boolean;
+  }
+  
+  export async function readPackagePermissions(): Promise<PackagePermissions> {
+    const netPermissions = await Promise.all(
+      PACKAGE_DOWNLOAD_DOMAINS.map((host) =>
+        Deno.permissions.query({ name: "net", host })
+      ),
+    );
+    const cacheDir = Deno.env.get("PACKAGE_CACHE_DIR");
+    const writePerms = cacheDir
+      ? await Deno.permissions.query({ name: "write", path: cacheDir })
+      : null;
+    return {
+      isNetworkDisabled: netPermissions.every((perm) => perm.state !== "granted"),
+      isRuntimePackagesDisabled: !writePerms || writePerms.state !== "granted",
+    };
+  }
+  
+  const configureSandboxTool: Tool = {
+    name: "configure",
+    config: {
+      title: "Configure Python Environment",
+      description:
+        "Configures the Python sandbox by loading packages and/or setting up callbacks to the host. Both actions are optional.",
+      inputSchema: {
+        globals: z
+          .record(z.any())
+          .optional()
+          .describe(
+            "A dictionary of global variables to inject into the Python scope.",
+          ),
+        mounts: z
+          .record(z.string())
+          .optional()
+          .describe("Dictionary of folders to mount to /mnt/{name} (Read-Only)."),
+        output_dir: z
+          .string()
+          .optional()
+          .describe("Absolute path on host to mount as / (Writeable)."),
+        tools: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "List of function names for direct callbacks from Python to the host.",
+          ),
+        proxy_tools: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "List of object names for dynamic proxies from Python to the host.",
+          ),
+        packages: z
+          .array(z.string())
+          .optional()
+          .describe("List of packages to load into the Pyodide environment."),
+        disable_net: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "If true, revokes all network access after loading packages.",
+          ),
+        disable_runtime_packages: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe(
+            "If true, prevents any more packages from being installed or modified.",
+          ),
+      },
+      outputSchema: { is_success: z.boolean() },
+    },
+    handler: async (
+      { pyodide, WORK_DIR },
+      {
+        globals,
+        mounts,
+        output_dir,
+        tools,
+        proxy_tools,
+        packages,
+        disable_net,
+        disable_runtime_packages,
+      },
+    ) => {
+      try {
+        if (globals) {
+          for (const [key, value] of Object.entries(globals)) {
+            pyodide.globals.set(key, pyodide.toPy(value));
+          }
+        }
+  
+        if (output_dir) {
+          pyodide.FS.mount(
+            pyodide.FS.filesystems.NODEFS,
+            { root: output_dir },
+            WORK_DIR,
+          );
+        }
+  
+        if (mounts && Object.keys(mounts).length > 0) {
+          const mountRoot = path.join(WORK_DIR, "mnt");
+          pyodide.FS.mkdirTree(mountRoot);
+  
+          for (const [name, hostPath] of Object.entries(mounts)) {
+            const mountPoint = path.join(mountRoot, name);
+            pyodide.FS.mkdirTree(mountPoint);
+            pyodide.FS.mount(
+              pyodide.FS.filesystems.NODEFS,
+              { root: hostPath },
+              mountPoint,
+            );
+          }
+        }
+  
+        if (tools?.length || proxy_tools?.length) {
+          const createCallback = pyodide.globals.get("_create_host_callback");
+          const DynamicProxyClass = pyodide.globals.get("_DynamicProxy");
+  
+          (tools ?? []).forEach((name: string) => {
+            const callbackFunc = createCallback(name);
+            pyodide.globals.set(name, callbackFunc);
+          });
+  
+          (proxy_tools ?? []).forEach((name: string) => {
+            pyodide.globals.set(name, DynamicProxyClass(name));
+          });
+        }
+  
+        if (packages?.length) {
+          const perms = await readPackagePermissions();
+  
+          if (perms.isNetworkDisabled) {
+            throw new Error(
+              "Network access is required to install Python packages.",
+            );
+          }
+          if (perms.isRuntimePackagesDisabled) {
+            throw new Error("Runtime package loading is disabled.");
+          }
+  
+          await pyodide.loadPackage(packages);
+        }
+  
+        return {
+          structuredContent: { is_success: true },
+          content: [
+            { type: "text", text: "Python environment configured successfully." },
+          ],
+        };
+      } catch (error: any) {
+        return {
+          structuredContent: { error: error.message },
+          content: [
+            { type: "text", text: `Configuration Error: ${error.message}` },
+          ],
+          isError: true,
+        };
+      } finally {
+        if (disable_net) {
+          await Deno.permissions.revoke({ name: "net" });
+        }
+        if (disable_runtime_packages) {
+          await Deno.permissions.revoke({
+            name: "write",
+            path: Deno.env.get("PACKAGE_CACHE_DIR"),
+          });
+        }
+      }
+    },
+  };
+  
+  const executePythonTool: Tool = {
+    name: "execute_python",
+    config: {
+      title: "Execute Python Code",
+      description:
+        "Executes Python code in the sandbox and optionally saves new files.",
+      inputSchema: {
+        code: z.string().describe("The Python code to execute."),
+        timeout: z.number().optional().describe("Execution timeout in seconds."),
+        auto_load_packages: z
+          .boolean()
+          .optional()
+          .default(false)
+          .describe("Whether packages should be auto-loaded."),
+      },
+      outputSchema: {
+        is_success: z.boolean(),
+        result: z.any().optional(),
+        error: z.string().optional(),
+        files: z
+          .array(z.string())
+          .optional()
+          .describe("Absolute paths to any output files saved on the host."),
+      },
+    },
+    handler: async (
+      { pyodide, WORK_DIR },
+      { code, timeout, auto_load_packages },
+    ) => {
+      const filesBefore = getVFSState(pyodide, WORK_DIR);
+      let timeoutId: number | undefined;
+  
+      if (auto_load_packages) {
+        await pyodide.loadPackagesFromImports(code);
+      }
+  
+      const execOptions = {
+        filename: "main.py",
+        return_mode: "last_expr_or_assign" as const,
+      };
+  
+      try {
+        const interruptBuffer = new Int32Array(new SharedArrayBuffer(4));
+        pyodide.setInterruptBuffer(interruptBuffer);
+  
+        const executionPromise = pyodide.runPythonAsync(code, execOptions);
+  
+        let resultProxy;
+        if (timeout && timeout > 0) {
+          const timeoutPromise = new Promise((_, reject) => {
+            timeoutId = setTimeout(() => {
+              Atomics.store(interruptBuffer, 0, 2);
+              reject(new Error(`Execution timed out after ${timeout} seconds`));
+            }, timeout * 1000);
+          });
+          resultProxy = await Promise.race([executionPromise, timeoutPromise]);
+        } else {
+          resultProxy = await executionPromise;
+        }
+  
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+  
+        const output_files: string[] = [];
+        const filesAfter = getVFSState(pyodide, WORK_DIR);
+  
+        for (const [filePath, mtimeAfter] of filesAfter.entries()) {
+          const mtimeBefore = filesBefore.get(filePath);
+          if (mtimeBefore === undefined || mtimeAfter > mtimeBefore) {
+            const relativePath = path.relative(WORK_DIR, filePath);
+            output_files.push(relativePath);
+          }
+        }
+  
+        const result =
+          resultProxy?.toJs?.({ dict_converter: Object.fromEntries }) ??
+            resultProxy; // TODO: robust serialize outputs
+  
+        const message = output_files.length > 0
+          ? `\nGenerated ${output_files.length} file(s).`
+          : "";
+  
+        return {
+          structuredContent: { is_success: true, result, files: output_files },
+          content: [
+            { type: "text", text: JSON.stringify({ result }, null, 2) + message },
+          ],
+        };
+      } catch (error: any) {
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+        return {
+          structuredContent: { error: error.message },
+          content: [
+            { type: "text", text: `Python Execution Error: ${error.message}` },
+          ],
+          isError: true,
+        };
+      } finally {
+        pyodide.setInterruptBuffer(undefined);
+      }
+    },
+  };
+  
+  export const TOOLS: Tool[] = [configureSandboxTool, executePythonTool];
+
+  [File Ends] sandbox/tools.ts
+
+
+<-- File Content Ends
